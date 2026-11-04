@@ -1,0 +1,177 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>SQL Lineage</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<style>
+:root{--bg:#f6f7f9;--fg:#1b2430;--card:#fff;--line:#d8dde5;--mut:#667085;--acc:#2563eb;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12161c;--fg:#e6eaf0;--card:#1b212b;--line:#2d3644;--mut:#9aa6b8}}
+*{box-sizing:inherit}html,body{height:100%}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:grid;grid-template-rows:auto 1fr}
+header{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;background:var(--card);border-bottom:1px solid var(--line)}
+button,select,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 9px}button{cursor:pointer}button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+#q{width:220px}#hits{position:absolute;top:46px;left:200px;z-index:9;background:var(--card);border:1px solid var(--line);width:340px;max-height:50vh;overflow:auto;display:none;border-radius:6px}#hits div{padding:5px 10px;cursor:pointer}#hits div:hover{background:var(--bg)}
+main{display:grid;grid-template-columns:1fr 420px;min-height:0}@media(max-width:900px){main{grid-template-columns:1fr;grid-auto-rows:minmax(50vh,auto)}}
+.pane{overflow:auto;padding:12px;min-height:0}#side{background:var(--card);border-left:1px solid var(--line)}#cy{height:100%;min-height:360px;background:var(--card);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}.wide{overflow-x:auto}
+pre{background:var(--bg);padding:8px;border-radius:6px;overflow:auto;font-size:12px;margin:4px 0}.tag{padding:1px 7px;border-radius:10px;font-size:12px;border:1px solid var(--line)}.ok{color:#16a34a}.warn{color:#d97706}.bad{color:#dc2626}
+.step{border:1px solid var(--line);border-radius:6px;margin:6px 0;padding:6px 8px;cursor:pointer}.step.on,.step:hover{border-color:var(--acc)}a{color:var(--acc);cursor:pointer}h4{margin:12px 0 4px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px}.kpi b{display:block;font-size:22px}
+</style></head><body>
+<header><b>SQL Lineage</b><span id="nav"></span><input id="q" placeholder="Search objects, columns, SQL (Ctrl+K)"><div id="hits"></div>
+<label>depth <select id="depth"><option>1</option><option selected>2</option><option>5</option><option value="99">full</option></select></label>
+<label>level <select id="level"><option value="table">table</option><option value="column">column</option></select></label>
+<span style="margin-left:auto;display:flex;gap:4px;align-items:center"><select id="dialect" title="Dialect (T-SQL parsing rules are used for all)"><option>tsql</option><option>postgres</option><option>mysql</option><option>oracle</option><option>snowflake</option><option>bigquery</option><option>ansi</option></select>
+<input type="file" id="f1" accept=".csv" title="tables.csv" style="width:86px"><input type="file" id="f2" accept=".csv" title="views.csv" style="width:86px"><input type="file" id="f3" accept=".csv" title="code.csv" style="width:86px"><button id="go">Load CSVs</button><button id="smp">Sample</button></span></header>
+<main><div class="pane" id="view"></div><div class="pane" id="side">Select an object to see details.</div></main>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const NAME='[#@]?[\\w\\[\\]\\."`]+',START=/^\s*(INSERT|UPDATE|DELETE|MERGE|EXEC(?:UTE)?|SELECT|WITH|DECLARE|SET|IF|ELSE|WHILE|BEGIN|END|CREATE|DROP|TRUNCATE|RETURN|COMMIT|ROLLBACK|PRINT|OPEN|CLOSE|FETCH|DEALLOCATE|RAISERROR|THROW)\b/i;
+const CONTROL=new Set('IF ELSE WHILE BEGIN END DECLARE SET RETURN COMMIT ROLLBACK PRINT OPEN CLOSE FETCH DEALLOCATE RAISERROR THROW DROP'.split(' ')),DYN=/\bsp_executesql\b|\bEXEC(?:UTE)?\s*\(|\bEXEC(?:UTE)?\s+@\w+/i;
+const KW=new Set('CASE WHEN THEN ELSE END AND OR NOT NULL IS IN AS CAST CONVERT INT INTEGER BIGINT SMALLINT DECIMAL NUMERIC FLOAT REAL VARCHAR NVARCHAR CHAR NCHAR DATE DATETIME DATETIME2 BIT LIKE BETWEEN EXISTS DISTINCT ASC DESC TRUE FALSE OVER PARTITION BY ORDER ON TOP'.split(' '));
+const C={TABLE:'#3b82f6',VIEW:'#22c55e',PROCEDURE:'#f97316',TEMP_TABLE:'#9ca3af',UNRESOLVED:'#ef4444',COLUMN:'#a78bfa',CTE:'#14b8a6',DYNAMIC_SQL:'#eab308'};
+const ACTION={PARSE_FAILED:'Check SQL syntax.',PARSED_PARTIAL:'Review warnings; add missing DDL or qualify columns.',DYNAMIC_SQL_DETECTED:'Review dynamic SQL manually.',UNRESOLVED_OBJECT:'Add the object to the CSV files.',MISSING_SQL:'Provide SQL.',DUPLICATE_OBJECT:'Remove duplicates.',MALFORMED_ROW:'Fix the row.',CIRCULAR_DEPENDENCY:'Confirm the cycle is intended.',ORPHAN_OBJECT:'Check whether the object is unused.'};
+let M,cy,cur,tab='dashboard';
+// ---------- CSV ----------
+function parseCSV(t){t=t.replace(/^\uFEFF/,'');const rows=[];let r=[],f='',q=false;for(let i=0;i<t.length;i++){const c=t[i];if(q){if(c=='"'){if(t[i+1]=='"'){f+='"';i++}else q=false}else f+=c}else if(c=='"')q=true;else if(c==','){r.push(f);f=''}else if(c=='\n'||c=='\r'){if(c=='\r'&&t[i+1]=='\n')i++;r.push(f);rows.push(r);r=[];f=''}else f+=c}if(f||r.length){r.push(f);rows.push(r)}return rows.filter(r=>r.some(x=>x.trim()))}
+const splitName=raw=>{const p=raw.replace(/[\[\]"`]/g,'').split('.').map(x=>x.trim()).filter(Boolean);return{name:p.at(-1)||'',schema:p.length>1?p.at(-2):null}};
+function objsFrom(text,col,issues){const rows=parseCSV(text),h=(rows.shift()||[]).map(x=>x.trim()),ni=h.indexOf(col),si=h.indexOf('SQL');if(ni<0||si<0)throw Error(`CSV needs columns ${col}, SQL (found ${h.join(', ')||'none'})`);const o={};
+ rows.forEach((r,n)=>{const raw=(r[ni]||'').trim();if(!raw)return issues.push({type:'MALFORMED_ROW',obj:'row '+(n+2),detail:'blank name'});const{name,schema}=splitName(raw),k=name.toLowerCase();if(o[k])return issues.push({type:'DUPLICATE_OBJECT',obj:raw,detail:'first kept'});const sql=r[si]||'';if(!sql.trim())issues.push({type:'MISSING_SQL',obj:raw,detail:''});o[k]={key:k,name,schema,sql}});return o}
+// ---------- SQL helpers ----------
+function findTop(s,word,from=0){const re=new RegExp(word+'\\b','iy');let d=0,q=false;for(let i=from;i<s.length;i++){const c=s[i];if(c=="'")q=!q;if(q)continue;if(c=='(')d++;else if(c==')')d--;else if(!d&&/[A-Za-z]/.test(c)&&(i==0||!/\w/.test(s[i-1]))){re.lastIndex=i;if(re.test(s))return i}}return -1}
+function splitTop(s){const out=[];let d=0,q=false,b=0;for(let i=0;i<s.length;i++){const c=s[i];if(c=="'")q=!q;if(q)continue;if(c=='(')d++;else if(c==')')d--;else if(c==','&&!d){out.push(s.slice(b,i));b=i+1}}out.push(s.slice(b));return out.map(x=>x.trim()).filter(Boolean)}
+function splitStmts(body,first){const out=[];let cur=null;body.split('\n').forEach((raw,i)=>{const s=raw.replace(/--.*$/,'').replace(/^\s*;+/,'').trimEnd();if(!s.trim())return;const m=START.exec(s),kw=m&&m[1].toUpperCase().replace('EXECUTE','EXEC');let sp=true;
+ if(cur){if(!m)sp=['BEGIN','END'].includes(cur.kw)&&!cur.t.includes('\n');else{const c=cur.t,h=cur.kw,n=(r)=>(c.match(r)||[]).length;
+  if(/;\s*$/.test(c))sp=true;else if(n(/\(/g)>n(/\)/g)||/\b(UNION(\s+ALL)?|INTERSECT|EXCEPT)\s*$/i.test(c))sp=false;
+  else if(kw=='END'&&n(/\bCASE\b/gi)>n(/\bEND\b/gi))sp=false;
+  else if((h=='INSERT'||h=='CREATE')&&['SELECT','WITH','EXEC'].includes(kw)&&!/\bSELECT\b/i.test(c))sp=false;
+  else if(h=='WITH'&&['SELECT','INSERT','UPDATE','DELETE','MERGE'].includes(kw)&&!/\)\s*(SELECT|INSERT|UPDATE|DELETE|MERGE)\b/i.test(c))sp=false;
+  else if(h=='UPDATE'&&kw=='SET')sp=false;else if(h=='MERGE'&&['INSERT','UPDATE','DELETE','SET','SELECT'].includes(kw))sp=false}}
+ if(sp){cur&&out.push(cur);cur={kw,t:s.trim(),line:first+i}}else cur.t+='\n'+s});cur&&out.push(cur);return out}
+// ---------- model ----------
+function analyze(tb,vb,cb){const issues=[];M={n:{},e:[],cols:{},defs:{},steps:{},flags:{},params:{},sql:{},issues,objs:{TABLE:objsFrom(tb,'TBLName',issues),VIEW:objsFrom(vb,'VWName',issues),PROCEDURE:objsFrom(cb,'SPName',issues)}};
+ for(const t in M.objs)for(const k in M.objs[t]){const o=M.objs[t][k];N(k,t,o.name,{schema:o.schema});M.flags[k]=new Set;M.steps[k]=[];M.sql[k]=o.sql}
+ for(const k in M.objs.TABLE)loadTable(M.objs.TABLE[k]);
+ for(const t of ['VIEW','PROCEDURE'])for(const k in M.objs[t]){try{runObj(M.objs[t][k],t)}catch(x){M.steps[k].push(blank(1,1,'ERROR','',null,0,{status:'PARSE_FAILED',warn:[x.message]}))}}
+ for(const k in M.flags)M.n[k].status=statusOf(k);M.cycles=cycles();return M}
+function N(key,type,name,x={}){M.n[key]||(M.n[key]={key,type,name,schema:x.schema||null,parent:x.parent||null})}
+function E(src,tgt,type,op,owner,s,expr='',conf='high'){M.e.push({id:M.e.length,source:src,target:tgt,type,op,owner,stmt:s?.idx??null,line:s?.line??null,sql:(s?.sql||'').slice(0,300),expr,conf})}
+function addCol(tk,c){const k=tk+'.'+c.toLowerCase();N(k,'COLUMN',c,{parent:tk});const l=M.cols[tk]||(M.cols[tk]=[]);if(!l.some(x=>x.toLowerCase()==c.toLowerCase()))l.push(c);return k}
+function ref(raw,owner,ctes){const{name,schema}=splitName(raw),k=name.toLowerCase();if(k[0]=='#'||k[0]=='@'){const key=k+'@'+owner;N(key,'TEMP_TABLE',name);return key}
+ if(ctes?.has(k)){const key=k+'@'+owner;N(key,'CTE',name);return key}if(['TABLE','VIEW','PROCEDURE'].some(t=>M.objs[t][k]))return k;N(k,'UNRESOLVED',name,{schema});M.flags[owner].add('UNRESOLVED_OBJECT');return k}
+function loadTable(o){const k=o.key,m=/\(([\s\S]*)\)/.exec(o.sql);M.defs[k]={};if(!m)return M.flags[k].add('PARSED_PARTIAL');
+ const pk=new Set((/PRIMARY\s+KEY\s*\(([^)]*)\)/i.exec(o.sql)?.[1]||'').split(',').map(x=>x.replace(/[\[\]"`\s]/g,'').toLowerCase()));
+ splitTop(m[1]).forEach(p=>{const c=/^[\[\"`]?(\w+)[\]\"`]?\s+([A-Za-z_]+(?:\s*\([^)]*\))?)/.exec(p);if(!c||/^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|KEY|CHECK|INDEX)$/i.test(c[1]))return;M.defs[k][c[1]]={type:c[2],pk:/PRIMARY\s+KEY/i.test(p)||pk.has(c[1].toLowerCase())};addCol(k,c[1])});
+ for(const r of o.sql.matchAll(new RegExp('REFERENCES\\s+('+NAME+')','gi'))){const rk=splitName(r[1]).name.toLowerCase();if(M.n[rk]&&rk!=k)E(rk,k,'TABLE_READS_FROM_TABLE','REFERENCES',k,null)}}
+const blank=(idx,line,op,sql,branch,depth,x={})=>({idx,line,op,sql,reads:[],writes:[],calls:[],maps:[],filters:'',vars:[...new Set(sql.match(/@\w+/g)||[])],branch,depth,status:'PARSED_FULL',warn:[],dynamic:false,...x});
+function runObj(o,type){const k=o.key;if(!o.sql.trim())return;let stm;
+ if(type=='PROCEDURE'){const m=new RegExp('\\bCREATE\\s+(?:OR\\s+ALTER\\s+)?PROC(?:EDURE)?\\s+'+NAME,'i').exec(o.sql);let body=o.sql,first=1;
+  if(m){const rest=o.sql.slice(m.index+m[0].length),am=/\bAS\b/i.exec(rest);if(am){M.params[k]=[...rest.slice(0,am.index).matchAll(/(@\w+)\s+([\w(),]+)/g)].map(x=>[x[1],x[2]]);M.params[k].forEach(p=>N(p[0].toLowerCase()+'@'+k,'PARAMETER',p[0]));body=rest.slice(am.index+2);first=o.sql.slice(0,m.index+m[0].length+am.index+2).split('\n').length}}
+  stm=splitStmts(body,first)}else stm=[{kw:'CREATE',t:o.sql.trim(),line:1}];
+ const stack=[];let pending=null;
+ stm.forEach((x,i)=>{const kw=x.kw||'',branch=pending||[...stack].reverse().find(b=>b)||null,depth=stack.filter(b=>b).length+(pending&&!CONTROL.has(kw)?1:0);
+  if(['IF','ELSE','WHILE'].includes(kw)){pending=x.t.split('\n')[0].slice(0,80)}else if(!CONTROL.has(kw))pending=null;
+  if(/^\s*BEGIN\s*(TRY|CATCH)?\s*;?$/i.test(x.t)){stack.push(pending);pending=null}else if(/^\s*END\s*(TRY|CATCH)?\s*;?$/i.test(x.t)&&stack.length)stack.pop();
+  const s=blank(i+1,x.line,kw||'OTHER',x.t,['IF','ELSE','WHILE'].includes(kw)?null:branch,depth);M.steps[k].push(s);doStmt(k,type,s,kw)});
+ M.steps[k].forEach(s=>{if(s.status!='PARSED_FULL')M.flags[k].add(s.status)})}
+function readsOf(t,owner,ctes,skip){const amap={},rd=[];const re=new RegExp('\\b(?:FROM|JOIN|USING)\\s+('+NAME+')(?:\\s+(?:AS\\s+)?(?!ON\\b|WHERE\\b|JOIN\\b|INNER\\b|LEFT\\b|RIGHT\\b|FULL\\b|CROSS\\b|GROUP\\b|ORDER\\b|UNION\\b|SET\\b|WHEN\\b|HAVING\\b)(\\w+))?','gi');
+ for(const m of t.matchAll(re)){const k=ref(m[1],owner,ctes);amap[splitName(m[1]).name.toLowerCase()]=k;if(m[2])amap[m[2].toLowerCase()]=k;if(k!=skip&&!rd.includes(k))rd.push(k)}return{amap,rd}}
+function addRead(s,owner,otype,k,conf){if(M.n[k].type=='CTE'||s.reads.includes(k))return;s.reads.push(k);const rt=M.n[k].type,u=rt=='UNRESOLVED';
+ E(k,owner,u?'UNRESOLVED_REFERENCE':otype=='VIEW'?(rt=='VIEW'?'VIEW_READS_FROM_VIEW':'VIEW_READS_FROM_TABLE'):(rt=='VIEW'?'PROCEDURE_USES_VIEW':'PROCEDURE_READS_FROM_TABLE'),'READ',owner,s,'',u?'unresolved':conf)}
+function addWrite(s,owner,otype,k,op,conf){if(otype=='VIEW'||k==owner)return;s.writes.push(k);E(owner,k,'PROCEDURE_WRITES_TO_TABLE',op,owner,s,'',conf)}
+function colRefs(expr,amap,s){const out=[],e=expr.replace(/'(?:[^']|'')*'/g,' ').replace(/@@?\w+/g,' '),srcs=[...new Set(Object.values(amap))];
+ for(const m of e.matchAll(/(?:([A-Za-z_]\w*)\s*\.\s*)?\b([A-Za-z_]\w*)\b(?!\s*[(.])/g)){const[,q,c]=m;if(KW.has(c.toUpperCase())||(!q&&/^[a-z]+$/.test(c)&&c==c.toUpperCase()&&false))continue;let tk=null;
+  if(q){tk=amap[q.toLowerCase()];if(!tk)continue}else if(srcs.length==1){tk=srcs[0];if(M.cols[tk]&&!M.cols[tk].some(x=>x.toLowerCase()==c.toLowerCase()))continue}
+  else{const cand=srcs.filter(k=>(M.cols[k]||[]).some(x=>x.toLowerCase()==c.toLowerCase()));if(cand.length==1)tk=cand[0];else if(cand.length>1||!srcs.length){s.warn.push('AMBIGUOUS_COLUMN: '+c);s.status='PARSED_PARTIAL';continue}else continue}
+  out.push([tk,c])}return out}
+function colmap(sk,sc,tk,tc,expr,owner,s){const a=addCol(sk,sc),b=addCol(tk,tc);E(a,b,expr?'COLUMN_TRANSFORMED_BY_EXPRESSION':'COLUMN_DERIVES_FROM_COLUMN',expr?'TRANSFORM':s.op,owner,s,expr,s.branch?'medium':'high');s.maps.push({src:a,tgt:b,expr})}
+function assign(tc,expr,w,amap,owner,s){const simple=/^[\w.\[\]"`]+$/.test(expr),refs=colRefs(expr,amap,s);refs.forEach(([sk,sc])=>colmap(sk,sc,w,tc,simple?'':expr.trim(),owner,s));if(!refs.length){addCol(w,tc);s.maps.push({src:null,tgt:w+'.'+tc.toLowerCase(),expr})}}
+function projSel(sel,w,tcols,amap,owner,s){let b=sel.replace(/^\s*(DISTINCT\s+|TOP\s*\(?\d+\)?\s+)?/i,'');const f=findTop(b,'FROM');if(f>=0)b=b.slice(0,f);
+ splitTop(b).forEach((it,i)=>{let m,expr=it,name=null;if(m=/^([\s\S]*?)\s+AS\s+[\[\"`]?(\w+)[\]\"`]?$/i.exec(it)){expr=m[1];name=m[2]}else if(m=/^[\[\"`]?(\w+)[\]\"`]?\s*=\s*([\s\S]+)$/.exec(it)){name=m[1];expr=m[2]}
+  const st=/^(?:(\w+)\.)?\*$/.exec(expr.trim());if(st){const tks=st[1]&&amap[st[1].toLowerCase()]?[amap[st[1].toLowerCase()]]:[...new Set(Object.values(amap))];tks.forEach(tk=>{if(!M.cols[tk]?.length){s.warn.push('SELECT * on unknown schema: '+tk);s.status='PARSED_PARTIAL'}(M.cols[tk]||[]).forEach(c=>colmap(tk,c,w,c,'',owner,s))});return}
+  name=name||(/^[\w.\[\]"`]+$/.test(expr.trim())?expr.trim().split('.').pop().replace(/[\[\]"`]/g,''):'col'+(i+1));assign(tcols?.[i]||name,expr.trim(),w,amap,owner,s)})}
+function doStmt(owner,otype,s,kw){const t=s.sql.replace(/;\s*$/,''),conf=s.branch?'medium':'high';let m;
+ if(CONTROL.has(kw)){s.op='CONTROL';s.control=kw;return}
+ const ctes=new Set([...t.matchAll(/(?:\bWITH|,)\s*(\w+)\s+AS\s*\(/gi)].map(x=>x[1].toLowerCase()));
+ if(DYN.test(t)){s.op='DYNAMIC';s.dynamic=true;s.status='DYNAMIC_SQL_DETECTED';s.warn.push('Dynamic SQL: only object names inside string literals were extracted (low confidence).');const dk='dyn:'+owner+':'+s.idx;N(dk,'DYNAMIC_SQL',null);M.n[dk].name='dynamic SQL #'+s.idx;E(owner,dk,'UNRESOLVED_REFERENCE','DYNAMIC',owner,s,'','unresolved');
+  for(const lit of t.matchAll(/'((?:[^']|'')*)'/g)){const w=/(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE\s+TABLE)\s+(\S+)/i.exec(lit[1]),wk=w?ref(w[1],owner):null,{rd}=readsOf(lit[1],owner,ctes,wk);rd.forEach(k=>addRead(s,owner,otype,k,'low'));if(w)addWrite(s,owner,otype,wk,'DYNAMIC','low')}return}
+ if(kw=='EXEC'&&(m=new RegExp('^\\s*EXEC(?:UTE)?\\s+(?:@\\w+\\s*=\\s*)?('+NAME+')','i').exec(t))){const ck=ref(m[1],owner);s.op='CALL';s.calls=[ck];if(M.n[ck].type=='UNRESOLVED'){s.status='PARSED_PARTIAL';E(owner,ck,'UNRESOLVED_REFERENCE','CALL',owner,s,'','unresolved')}else E(owner,ck,'PROCEDURE_CALLS_PROCEDURE','CALL',owner,s,'',conf);return}
+ if(kw=='TRUNCATE'){s.op='TRUNCATE';m=new RegExp('TRUNCATE\\s+TABLE\\s+('+NAME+')','i').exec(t);m?addWrite(s,owner,otype,ref(m[1],owner),'TRUNCATE',conf):s.status='PARSE_FAILED';return}
+ let w=null,tcols=null,body='',sets=null,N_=NAME;
+ if(m=new RegExp('^INSERT\\s+(?:INTO\\s+)?('+N_+')\\s*(?:\\(([^)]*)\\))?','i').exec(t)){w=m[1];tcols=m[2]?.split(',').map(x=>x.trim().replace(/[\[\]"`]/g,''));body=t.slice(m[0].length);s.op='INSERT'}
+ else if(m=new RegExp('^CREATE\\s+(?:OR\\s+ALTER\\s+)?VIEW\\s+('+N_+')\\s*(?:\\(([^)]*)\\))?\\s*AS\\b','i').exec(t)){w=m[1];tcols=m[2]?.split(',').map(x=>x.trim());body=t.slice(m[0].length);s.op='CREATE_VIEW'}
+ else if(m=new RegExp('^CREATE\\s+TABLE\\s+('+N_+')\\s*\\(([\\s\\S]*)\\)\\s*$','i').exec(t)){w=m[1];s.op='CREATE';const wk=ref(w,owner,ctes);splitTop(m[2]).forEach(p=>{const c=/^[\[\"`]?(\w+)/.exec(p);if(c)addCol(wk,c[1])});addWrite(s,owner,otype,wk,'CREATE',conf);return}
+ else if(m=new RegExp('^UPDATE\\s+('+N_+')\\s+SET\\s+([\\s\\S]*)$','i').exec(t)){w=m[1];s.op='UPDATE';let r=m[2];const f=findTop(r,'FROM'),wh=findTop(r,'WHERE');const end=[f,wh].filter(x=>x>=0).sort((a,b)=>a-b)[0];sets=splitTop(end>=0?r.slice(0,end):r);body=end>=0?r.slice(end):''}
+ else if(m=new RegExp('^DELETE\\s+(?:FROM\\s+)?('+N_+')','i').exec(t)){w=m[1];s.op='DELETE';body=t.slice(m[0].length)}
+ else if(m=new RegExp('^MERGE\\s+(?:INTO\\s+)?('+N_+')','i').exec(t)){w=m[1];s.op='MERGE';body=t.slice(m[0].length)}
+ else if(kw=='SELECT'||kw=='WITH'){s.op='SELECT';const im=new RegExp('\\bINTO\\s+('+N_+')\\s*(?=FROM)','i').exec(t);let tt=t;if(im){w=im[1];s.op='SELECT_INTO';tt=t.replace(im[0],'')}body=tt}
+ else{s.status='PARSE_FAILED';s.warn.push('Unrecognised statement');return}
+ const wk=w?ref(w,owner,ctes):null,{amap,rd}=readsOf(body,owner,ctes,wk);if(wk&&s.op=='UPDATE')amap[splitName(w).name.toLowerCase()]=wk;
+ rd.forEach(k=>addRead(s,owner,otype,k,conf));if(wk)addWrite(s,owner,otype,wk,s.op,conf);const tk=otype=='VIEW'?owner:wk;
+ const wh=findTop(body,'WHERE');s.filters=wh>=0?body.slice(wh+5).split(/\bGROUP\s+BY|\bORDER\s+BY/i)[0].trim():'';
+ if(tk){const si=findTop(body,'SELECT');if(si>=0)projSel(body.slice(si+6),tk,tcols,amap,owner,s);if(sets)sets.forEach(x=>{const e=/^([\w.\[\]"`]+)\s*=\s*([\s\S]+)$/.exec(x);if(e)assign(e[1].split('.').pop().replace(/[\[\]"`]/g,''),e[2],tk,amap,owner,s)})}
+ if(kw!='SELECT'&&!s.reads.length&&!s.writes.length&&otype!='VIEW')s.status='PARSE_FAILED'}
+function statusOf(k){const st=M.steps[k],real=st.filter(s=>s.op!='CONTROL'),ty=M.n[k].type;if(['VIEW','PROCEDURE'].includes(ty)&&(!st.length||(real.length&&real.every(s=>s.status=='PARSE_FAILED'))))return 'PARSE_FAILED';
+ if(st.some(s=>s.dynamic))return 'DYNAMIC_SQL_DETECTED';return st.some(s=>s.status!='PARSED_FULL')||M.flags[k].has('UNRESOLVED_OBJECT')||M.flags[k].has('PARSED_PARTIAL')?'PARSED_PARTIAL':'PARSED_FULL'}
+// ---------- graph ----------
+const isCol=e=>e.type.startsWith('COLUMN');
+function adj(level){const s={},p={};M.e.forEach(e=>{if((level=='column')!=isCol(e)||e.op=='REFERENCES')return;(s[e.source]??=new Set).add(e.target);(p[e.target]??=new Set).add(e.source)});return{s,p}}
+function bfs(key,depth,dir,level){const a=adj(level)[dir=='down'?'s':'p'],seen={[key]:0},q=[key];while(q.length){const u=q.shift();if(seen[u]>=depth)continue;for(const v of a[u]||[])if(!(v in seen)){seen[v]=seen[u]+1;q.push(v)}}return seen}
+const sev=d=>d<=1?'Critical':d<=2?'High':d<=5?'Medium':'Low',lvl=k=>M.n[k].type=='COLUMN'?'column':'table';
+function impact(k){const r=bfs(k,99,'down',lvl(k));return Object.entries(r).filter(([x])=>x!=k).map(([x,d])=>({key:x,name:M.n[x].name,type:M.n[x].type,depth:d,sev:sev(d)})).sort((a,b)=>a.depth-b.depth||a.name.localeCompare(b.name))}
+function cycles(){const{s}=adj('table'),skip=k=>['TEMP_TABLE','CTE'].includes(M.n[k]?.type),idx={},low={},on=new Set,st=[],out=[];let i=0;
+ const go=v=>{idx[v]=low[v]=i++;st.push(v);on.add(v);for(const w of s[v]||[]){if(skip(w))continue;if(!(w in idx)){go(w);low[v]=Math.min(low[v],low[w])}else if(on.has(w))low[v]=Math.min(low[v],idx[w])}
+  if(low[v]==idx[v]){const c=[];let w;do{w=st.pop();on.delete(w);c.push(w)}while(w!=v);if(c.length>1)out.push(c)}};Object.keys(s).filter(k=>!skip(k)&&!(k in idx)).forEach(go);return out}
+function health(){const r=M.issues.map(i=>({type:i.type,object:i.obj,detail:i.detail,action:ACTION[i.type]}));
+ for(const k in M.steps)M.steps[k].forEach(s=>{if(s.status!='PARSED_FULL'||s.warn.length)r.push({type:s.status,object:M.n[k].name,detail:(s.warn[0]||s.sql.slice(0,100))+` [stmt ${s.idx}, line ${s.line}]`,action:ACTION[s.status]||'Review'})});
+ Object.values(M.n).filter(n=>n.type=='UNRESOLVED').forEach(n=>r.push({type:'UNRESOLVED_OBJECT',object:n.name,detail:'Referenced but not defined',action:ACTION.UNRESOLVED_OBJECT}));
+ M.cycles.forEach(c=>r.push({type:'CIRCULAR_DEPENDENCY',object:c.map(k=>M.n[k].name).join(' ↔ '),detail:'Cycle in table-level lineage',action:ACTION.CIRCULAR_DEPENDENCY}));
+ const a=adj('table');Object.values(M.n).filter(n=>['TABLE','VIEW','PROCEDURE'].includes(n.type)&&!a.s[n.key]&&!a.p[n.key]).forEach(n=>r.push({type:'ORPHAN_OBJECT',object:n.name,detail:'No lineage edges',action:ACTION.ORPHAN_OBJECT}));return r}
+//--UI--
+const sample={t:`TBLName,SQL\n"dbo.RawOrders","CREATE TABLE dbo.RawOrders (OrderID INT PRIMARY KEY, CustomerID INT, Quantity INT, UnitPrice DECIMAL(18,2), OrderDate DATETIME)"\n"dbo.StgOrders","CREATE TABLE dbo.StgOrders (OrderID INT, CustomerID INT, Quantity INT, UnitPrice DECIMAL(18,2), OrderDate DATETIME)"\n"dbo.CustomerMaster","CREATE TABLE dbo.CustomerMaster (CustomerID INT PRIMARY KEY, Name NVARCHAR(100))"\n"dbo.SalesFact","CREATE TABLE dbo.SalesFact (OrderID INT PRIMARY KEY, CustomerID INT REFERENCES dbo.CustomerMaster(CustomerID), Revenue DECIMAL(18,2), OrderDate DATETIME)"\n"dbo.AuditLog","CREATE TABLE dbo.AuditLog (Msg NVARCHAR(200))"`,
+v:`VWName,SQL\n"dbo.vw_SalesClean","CREATE VIEW dbo.vw_SalesClean AS\nSELECT OrderID, CustomerID, Quantity, UnitPrice, OrderDate\nFROM dbo.StgOrders\nWHERE Quantity > 0"`,
+c:`SPName,SQL\n"dbo.usp_Staging_LoadOrders","CREATE PROCEDURE dbo.usp_Staging_LoadOrders @LoadDate DATETIME AS\nBEGIN\n  SET NOCOUNT ON;\n  TRUNCATE TABLE dbo.StgOrders;\n  INSERT INTO dbo.StgOrders (OrderID, CustomerID, Quantity, UnitPrice, OrderDate)\n  SELECT OrderID, CustomerID, Quantity, UnitPrice, OrderDate FROM dbo.RawOrders WHERE OrderDate >= @LoadDate;\nEND"\n"dbo.usp_LoadSalesFact","CREATE PROCEDURE dbo.usp_LoadSalesFact AS\nBEGIN\n  CREATE TABLE #Tmp (OrderID INT, Revenue DECIMAL(18,2));\n  INSERT INTO #Tmp (OrderID, Revenue)\n  SELECT OrderID, Quantity * UnitPrice FROM dbo.vw_SalesClean;\n  IF EXISTS (SELECT 1 FROM #Tmp)\n  BEGIN\n    INSERT INTO dbo.SalesFact (OrderID, CustomerID, Revenue, OrderDate)\n    SELECT v.OrderID, v.CustomerID, t.Revenue, v.OrderDate\n    FROM dbo.vw_SalesClean v JOIN #Tmp t ON t.OrderID = v.OrderID;\n  END\n  EXEC dbo.usp_Audit 'SalesFact loaded';\n  EXEC('DELETE FROM dbo.AuditLog WHERE 1 = 0');\nEND"\n"dbo.usp_Audit","CREATE PROCEDURE dbo.usp_Audit @Msg NVARCHAR(200) AS\nBEGIN\n  INSERT INTO dbo.AuditLog (Msg) SELECT @Msg;\nEND"`};
+const tabs=['dashboard','explorer','health'];$('#nav').innerHTML=tabs.map(t=>`<button data-t="${t}">${t}</button>`).join(' ');$('#nav').onclick=e=>e.target.dataset.t&&show(e.target.dataset.t);
+const label=n=>n.type=='COLUMN'?(M.n[n.parent]?.name||'')+'.'+n.name:n.name;
+function dl(name,text,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click()}
+const csv=rows=>{const k=Object.keys(rows[0]||{});return[k.join(','),...rows.map(r=>k.map(c=>'"'+String(r[c]??'').replace(/"/g,'""')+'"').join(','))].join('\n')};
+function show(t){tab=t;document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on',b.dataset.t==t));const v=$('#view');if(!M)return;
+ if(t=='dashboard'){const c={};Object.values(M.n).forEach(n=>c[n.type]=(c[n.type]||0)+1);const objs=Object.values(M.n).filter(n=>['VIEW','PROCEDURE'].includes(n.type)),st={};objs.forEach(n=>st[n.status]=(st[n.status]||0)+1);
+  const a=adj('table'),deg=Object.values(M.n).filter(n=>['TABLE','VIEW','PROCEDURE'].includes(n.type)).map(n=>[(a.s[n.key]?.size||0)+(a.p[n.key]?.size||0),n.name]).sort((x,y)=>y[0]-x[0]).slice(0,8);
+  v.innerHTML=`<div class="kpis">${[['Tables',c.TABLE],['Views',c.VIEW],['Procedures',c.PROCEDURE],['Columns',c.COLUMN],['Edges',M.e.length],['Unresolved',c.UNRESOLVED],['Parse errors',st.PARSE_FAILED],['Health',Math.round(100*(st.PARSED_FULL||0)/(objs.length||1))+'%']].map(([x,y])=>`<div class="kpi"><b>${y||0}</b>${x}</div>`).join('')}</div>
+  <h4>Most connected</h4><table>${deg.map(d=>`<tr><td>${esc(d[1])}<td>${d[0]}</tr>`).join('')}</table><h4>Parse status (views, procedures)</h4><table>${Object.entries(st).map(([k,n])=>`<tr><td>${k}<td>${n}</tr>`).join('')}</table>
+  <h4>Ingestion issues</h4><table>${M.issues.map(i=>`<tr><td>${i.type}<td>${esc(i.obj)}<td>${esc(i.detail)}</tr>`).join('')||'<tr><td>None</tr>'}</table>
+  <p><button id="x1">Edges CSV</button> <button id="x2">Inventory CSV</button> <button id="x3">Column mapping CSV</button> <button id="x4">Model JSON</button></p>`;
+  const inv=Object.values(M.n).filter(n=>['TABLE','VIEW','PROCEDURE'].includes(n.type)).map(n=>({name:n.name,type:n.type,schema:n.schema,status:n.status||'',downstream:impact(n.key).length}));
+  $('#x1').onclick=()=>dl('edges.csv',csv(M.e),'text/csv');$('#x2').onclick=()=>dl('inventory.csv',csv(inv),'text/csv');$('#x3').onclick=()=>dl('mapping.csv',csv(M.e.filter(isCol).map(e=>({source:e.source,target:e.target,expression:e.expr,owner:e.owner,stmt:e.stmt,line:e.line,confidence:e.conf}))),'text/csv');
+  $('#x4').onclick=()=>dl('lineage.json',JSON.stringify({nodes:M.n,edges:M.e,steps:M.steps},null,1),'application/json')}
+ else if(t=='explorer'){v.innerHTML='<div id="cy"></div>';cur?focus(cur):v.firstChild.textContent=''}
+ else v.innerHTML=`<div class="wide"><table><tr><th>Issue<th>Object<th>Detail<th>Recommended action</tr>${health().map(i=>`<tr><td class="${/FAILED|UNRESOLVED/.test(i.type)?'bad':'warn'}">${i.type}<td>${esc(i.object)}<td>${esc(i.detail)}<td>${esc(i.action)}</tr>`).join('')}</table></div>`}
+function focus(k){const lv=$('#level').value,d=+$('#depth').value,keys=lv=='column'&&M.n[k].type!='COLUMN'?(M.cols[k]||[]).map(c=>k+'.'+c.toLowerCase()):[k],hop={};
+ keys.forEach(x=>{const u=bfs(x,d,'up',lvl(x)),w=bfs(x,d,'down',lvl(x));for(const y in u)hop[y]=Math.min(-u[y],hop[y]??0);for(const y in w)hop[y]=hop[y]!==undefined&&hop[y]<0&&w[y]>0?hop[y]:w[y]});
+ if(!keys.length)return;const ids=new Set(Object.keys(hop)),ed={};M.e.forEach(e=>{if(ids.has(e.source)&&ids.has(e.target)&&e.op!='REFERENCES'&&(lv=='column'||M.n[k].type=='COLUMN')==isCol(e)){const o=ed[e.source+'>'+e.target]||(ed[e.source+'>'+e.target]={id:e.source+'>'+e.target,source:e.source,target:e.target,ops:new Set,low:false});o.ops.add(e.op);if(e.conf=='low'||e.conf=='unresolved')o.low=true}});
+ const col=getComputedStyle(document.body).color;cy=cytoscape({container:$('#cy'),wheelSensitivity:.3,layout:{name:'breadthfirst',directed:true,spacingFactor:1.2},
+  elements:[...[...ids].map(id=>({data:{id,label:label(M.n[id]),type:M.n[id].type}})),...Object.values(ed).map(o=>({data:{id:o.id,source:o.source,target:o.target,label:[...o.ops].join(','),low:o.low?1:0}}))],
+  style:[{selector:'node',style:{label:'data(label)','font-size':10,color:col,'background-color':n=>C[n.data('type')]||'#999','text-valign':'bottom','text-margin-y':3,shape:n=>n.data('type')=='PROCEDURE'?'round-rectangle':n.data('type')=='DYNAMIC_SQL'?'diamond':'ellipse'}},
+   {selector:'edge',style:{width:1.5,'curve-style':'bezier','target-arrow-shape':'triangle','line-color':'#94a3b8','target-arrow-color':'#94a3b8',label:'data(label)','font-size':8,color:'#94a3b8'}},
+   {selector:'edge[low=1]',style:{'line-style':'dashed','line-color':'#ef4444','target-arrow-color':'#ef4444'}},{selector:'.hl',style:{'border-width':4,'border-color':'#2563eb'}}]});
+ cy.getElementById(k).style({'border-width':3,'border-color':col});cy.on('tap','node',e=>select(e.target.id()))}
+function select(k){cur=k;location.hash=k;detail(k);if(tab!='explorer')show('explorer');else focus(k)}
+function detail(k){const n=M.n[k],st=M.steps[k]||[],lst=a=>Object.keys(a).filter(x=>x!=k).map(x=>`<a data-k="${x}">${esc(label(M.n[x]))}</a> <span class="tag">${M.n[x].type}</span>`).join('<br>')||'—',L=lvl(k);
+ const calls=a=>a.map(r=>`<a data-k="${r}">${esc(r.split('@')[0])}</a>`).join(', ');
+ $('#side').innerHTML=`<h3>${esc(label(n))} <span class="tag" style="background:${C[n.type]}33">${n.type}</span></h3><div class="${n.status=='PARSED_FULL'?'ok':'warn'}">${n.status||''}</div>
+ ${st.flatMap(s=>s.warn).length?`<h4 class="warn">Warnings</h4>${st.flatMap(s=>s.warn).map(w=>`<div>${esc(w)}</div>`).join('')}`:''}
+ ${st.length?`<h4>Execution steps</h4>`+st.filter(s=>s.op!='CONTROL'||s.control!='SET').map(s=>`<div class="step" data-s="${s.idx}"><b>${s.idx}. ${s.op}</b> <span class="tag ${s.status=='PARSED_FULL'?'ok':'warn'}">${s.status}</span> line ${s.line}${s.branch?`<br><i>if: ${esc(s.branch)}</i>`:''}${s.reads.length?`<br>reads: ${calls(s.reads)}`:''}${s.writes.length?`<br>writes: ${calls(s.writes)}`:''}${s.calls.length?`<br>calls: ${calls(s.calls)}`:''}${s.maps.map(m=>`<br><small>${esc(m.src||'∅')} → ${esc(m.tgt)}${m.expr?' = '+esc(m.expr):''}</small>`).join('')}${s.filters?`<br><small>WHERE ${esc(s.filters)}</small>`:''}<pre>${esc(s.sql)}</pre></div>`).join(''):''}
+ <h4>Upstream</h4>${lst(bfs(k,1,'up',L))}<h4>Downstream</h4>${lst(bfs(k,1,'down',L))}
+ <h4>Impact</h4><table>${impact(k).map(r=>`<tr><td><a data-k="${r.key}">${esc(r.name)}</a><td>${r.depth}<td>${r.sev}</tr>`).join('')||'<tr><td>No downstream objects</tr>'}</table>
+ ${M.cols[k]?.length&&n.type!='COLUMN'?`<h4>Columns</h4><table>${M.cols[k].map(c=>`<tr><td><a data-k="${k}.${c.toLowerCase()}">${esc(c)}</a><td>${esc(M.defs[k]?.[c]?.type||'')}<td>${M.defs[k]?.[c]?.pk?'PK':''}</tr>`).join('')}</table>`:''}
+ ${M.sql[k]?`<h4>SQL <button id="cp">Copy</button></h4><pre>${esc(M.sql[k]).split('\n').map((l,i)=>String(i+1).padStart(3)+'  '+l).join('\n')}</pre>`:''}`;
+ $('#cp')&&($('#cp').onclick=()=>navigator.clipboard.writeText(M.sql[k]));
+ document.querySelectorAll('.step').forEach(el=>el.onclick=e=>{if(e.target.tagName=='A')return;const s=st.find(x=>x.idx==el.dataset.s);document.querySelectorAll('.step').forEach(x=>x.classList.toggle('on',x==el));cy&&(cy.nodes().removeClass('hl'),[...s.reads,...s.writes,...s.calls].forEach(id=>cy.getElementById(id).addClass('hl')))})}
+document.addEventListener('click',e=>{const k=e.target.dataset?.k;if(k)select(k);$('#hits').style.display='none'});
+let tm;$('#q').oninput=()=>{clearTimeout(tm);tm=setTimeout(()=>{const q=$('#q').value.toLowerCase().trim();if(!q||!M)return $('#hits').style.display='none';
+ const r=Object.values(M.n).map(n=>{const nm=label(n).toLowerCase(),s=nm==q?100:nm.startsWith(q)?80:nm.includes(q)?60:0,sql=(M.sql[n.key]||'').toLowerCase();return{n,s:s||(sql.includes(q)?20:0)}}).filter(x=>x.s).sort((a,b)=>b.s-a.s).slice(0,20);
+ $('#hits').innerHTML=r.map(x=>`<div data-k="${x.n.key}">${esc(label(x.n))} <span class="tag">${x.n.type}</span>${x.s==20?' <small>(in SQL)</small>':''}</div>`).join('');$('#hits').style.display='block'},120)};
+addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key=='k'){e.preventDefault();$('#q').focus()}});
+$('#depth').onchange=$('#level').onchange=()=>cur&&tab=='explorer'&&focus(cur);
+const load=(a,b,c)=>{try{analyze(a,b,c);cur=null;show('dashboard')}catch(x){alert('Load failed: '+x.message)}};
+$('#smp').onclick=()=>load(sample.t,sample.v,sample.c);
+$('#go').onclick=async()=>{const f=['#f1','#f2','#f3'].map(s=>$(s).files[0]);if(f.some(x=>!x))return alert('Choose tables.csv, views.csv and code.csv');load(...await Promise.all(f.map(x=>x.text())))};
+load(sample.t,sample.v,sample.c);if(location.hash.length>1&&M.n[decodeURIComponent(location.hash.slice(1))])select(decodeURIComponent(location.hash.slice(1)));
+</script></body></html>
